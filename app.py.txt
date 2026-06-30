@@ -1,0 +1,188 @@
+import streamlit as st
+import spacy
+import pandas as pd
+import re
+
+# 1. 자연어 처리 모델 로드 (최초 1회만)
+@st.cache_resource
+def load_nlp():
+    return spacy.load("en_core_web_sm")
+
+nlp = load_nlp()
+
+# 2. 문장 분석 엔진 (정밀 보정 및 패턴 에러 완벽 해결 버전)
+def analyze_sentence(line, target_word):
+    raw_line = line.strip()
+    if not raw_line:
+        return None
+        
+    # [다중 문장 분절] SpaCy 문장 단위 분절
+    full_doc = nlp(raw_line)
+    
+    target_sentence_text = None
+    for sent in full_doc.sents:
+        if target_word in sent.text.lower():
+            target_sentence_text = sent.text.strip()
+            break
+            
+    if not target_sentence_text:
+        target_sentence_text = raw_line
+
+    # [정밀 전처리] 화자 기호(예: TRUMP):, LARA-BROWN# 등)을 안전하게 제거
+    cleaned_sentence = re.sub(r'^[A-Za-z0-9_\s\(\)\-]+[\):\]#]', '', target_sentence_text).strip()
+    
+    # [구어체 정밀 보정] 문두에 붙는 단골 추임새 패턴 제거 (I mean, you know, well, like, oh)
+    cleaned_sentence = re.sub(r'^(i\s+mean|you\s+know|well|like|oh)\b[\s,]*', '', cleaned_sentence, flags=re.IGNORECASE).strip()
+    
+    if not cleaned_sentence or target_word not in cleaned_sentence.lower():
+        cleaned_sentence = target_sentence_text
+    
+    # 형태소 분석 진행
+    doc = nlp(cleaned_sentence)
+    tokens = [token for token in doc if not token.is_punct and not token.is_space]
+    total_len = len(tokens)
+    
+    if total_len == 0:
+        return None
+
+    # 타겟 단어 위치 찾기
+    target_idx = -1
+    for i, token in enumerate(tokens):
+        if token.text.lower() == target_word:
+            target_idx = i
+            break
+            
+    if target_idx == -1:
+        return None
+
+    # --- 📊 연구용 직관적 위치 판정 규칙 ---
+    if target_idx == 0:
+        position = "Front"
+    elif target_idx == 1 and tokens[0].text.lower() in ["and", "but", "so", "however", "yet"]:
+        position = "Front"
+    elif target_idx == total_len - 1:
+        position = "End"
+    else:
+        position = "Mid"
+        
+    # --- 공기어(Collocation) 추출 ---
+    collocation = "None"
+    if target_idx + 1 < total_len:
+        next_token = tokens[target_idx + 1]
+        collocation = f"{target_word} {next_token.text.lower()}"
+
+    return {
+        "Target": target_word, 
+        "Position": position, 
+        "Collocation": collocation, 
+        "Target_Sentence": target_sentence_text
+    }
+
+
+# 3. 웹 사이트 UI 화면 그리기 (Streamlit)
+st.set_page_config(page_title="📝담화 표지어 분석기", layout="wide")
+
+st.title("📝담화 표지어 분석기")
+st.markdown("화자 태그와 구어체 추임새(**I mean, You know**)를 정교하게 필터링하여 담화 표지어의 문장 내 위치를 판별합니다.")
+
+st.divider()
+
+# 좌측 사이드바 설정 (출처 선택만 남김)
+st.sidebar.header("📋 연구 변수 및 환경 설정")
+corpus_source = st.sidebar.selectbox(
+    "데이터의 코퍼스 출처(Source) 선택:",
+    ["L1 (COCA Spoken)", "L2 (ICNALE SD)"]
+)
+
+# 두 단어의 데이터를 독립적으로 보존하기 위해 상단 탭(Tabs) 기능 도입
+tab_basically, tab_actually = st.tabs(["🔍 basically 분석", "🔍 actually 분석"])
+
+# --- [basically 탭 구조] ---
+with tab_basically:
+    st.subheader(f"📊 [{corpus_source}] - [basically] 문장 데이터 입력")
+    user_input_b = st.text_area(
+        "코퍼스에서 추출한 basically 문장들을 입력해 주세요 (다른 탭으로 넘어가도 초기화되지 않습니다):",
+        height=200,
+        key="text_area_basically"
+    )
+
+    if st.button("🚀 basically 데이터 분석 시작", key="btn_basically"):
+        if user_input_b.strip() == "":
+            st.warning("분석할 문장을 입력해 주세요!")
+        else:
+            lines = [line for line in user_input_b.split("\n") if line.strip() != ""]
+            results = []
+            for line in lines:
+                analysis = analyze_sentence(line, "basically")
+                if analysis:
+                    results.append({
+                        "Corpus_Source": corpus_source,
+                        "Target": "basically",
+                        "Original_Line": line,
+                        "Extracted_Sentence": analysis["Target_Sentence"],
+                        "Position": analysis["Position"],
+                        "Collocation": analysis["Collocation"],
+                        "Functional_Cue (연구자 코딩용)": "선택 필요"
+                    })
+            if not results:
+                st.error("입력된 문장 중 'basically'가 포함된 문장이 없습니다.")
+            else:
+                df = pd.DataFrame(results)
+                st.subheader("📊 basically 요약 통계")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write("**[담화 위치 빈도 분포]**")
+                    st.dataframe(df["Position"].value_counts())
+                with col2:
+                    st.write("**[상위 콜로케이션 패턴]**")
+                    st.dataframe(df["Collocation"].value_counts().head(10))
+                st.divider()
+                st.subheader("📁 최종 연구용 로우 데이터 시트")
+                st.dataframe(df, use_container_width=True)
+                csv = df.to_csv(index=False).encode('utf-8-sig')
+                st.download_button(label="📥 basically 결과 다운로드", data=csv, file_name=f"{corpus_source.replace(' ', '_')}_basically_data.csv", mime="text/csv")
+
+# --- [actually 탭 구조] ---
+with tab_actually:
+    st.subheader(f"📊 [{corpus_source}] - [actually] 문장 데이터 입력")
+    user_input_a = st.text_area(
+        "코퍼스에서 추출한 actually 문장들을 입력해 주세요 (다른 탭으로 넘어가도 초기화되지 않습니다):",
+        height=200,
+        key="text_area_actually"
+    )
+
+    if st.button("🚀 actually 데이터 분석 시작", key="btn_actually"):
+        if user_input_a.strip() == "":
+            st.warning("분석할 문장을 입력해 주세요!")
+        else:
+            lines = [line for line in user_input_a.split("\n") if line.strip() != ""]
+            results = []
+            for line in lines:
+                analysis = analyze_sentence(line, "actually")
+                if analysis:
+                    results.append({
+                        "Corpus_Source": corpus_source,
+                        "Target": "actually",
+                        "Original_Line": line,
+                        "Extracted_Sentence": analysis["Target_Sentence"],
+                        "Position": analysis["Position"],
+                        "Collocation": analysis["Collocation"],
+                        "Functional_Cue (연구자 코딩용)": "선택 필요"
+                    })
+            if not results:
+                st.error("입력된 문장 중 'actually'가 포함된 문장이 없습니다.")
+            else:
+                df = pd.DataFrame(results)
+                st.subheader("📊 actually 요약 통계")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write("**[담화 위치 빈도 분포]**")
+                    st.dataframe(df["Position"].value_counts())
+                with col2:
+                    st.write("**[상위 콜로케이션 패턴]**")
+                    st.dataframe(df["Collocation"].value_counts().head(10))
+                st.divider()
+                st.subheader("📁 최종 연구용 로우 데이터 시트")
+                st.dataframe(df, use_container_width=True)
+                csv = df.to_csv(index=False).encode('utf-8-sig')
+                st.download_button(label="📥 actually 결과 다운로드", data=csv, file_name=f"{corpus_source.replace(' ', '_')}_actually_data.csv", mime="text/csv")
